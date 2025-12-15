@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Private Chat</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<h2>Your Temporary Key (changes)</h2>
+<div id="myKey"></div>
+
+<input id="friendKey" placeholder="Enter friend key">
+<button onclick="sendRequest()">Send Request</button>
+
+<h3>Contacts</h3>
+<ul id="contacts"></ul>
+
+<h3>Chat</h3>
+<div id="chatBox"></div>
+<input id="msg">
+<button onclick="sendMsg()">Send</button>
+
+<script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+<script src="/static/crypto.js"></script>
+
+</body>
+</html>
