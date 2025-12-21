@@ -1,29 +1,93 @@
 from flask import Flask, render_template, request
-from flask_socketio import SocketIO, emit
+from flask_socketio import SocketIO, emit, disconnect
+import json
+import os
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'secret'
+app.config['SECRET_KEY'] = 'secret'  # Change this in production!
 socketio = SocketIO(app, cors_allowed_origins="*")
 
+# In-memory storage (use Redis/DB for production)
 clients = {}        # permanent_id -> socket_id
 temp_keys = {}      # temp_key -> permanent_id
 contacts = {}       # permanent_id -> set(permanent_ids)
+public_keys = {}    # permanent_id -> public_key (base64)
+
+# File-based persistence (optional)
+CONTACTS_FILE = 'contacts.json'
+
+def load_contacts():
+    """Load contacts from file if exists"""
+    global contacts
+    if os.path.exists(CONTACTS_FILE):
+        try:
+            with open(CONTACTS_FILE, 'r') as f:
+                data = json.load(f)
+                contacts = {k: set(v) for k, v in data.items()}
+        except:
+            contacts = {}
+
+def save_contacts():
+    """Save contacts to file"""
+    try:
+        with open(CONTACTS_FILE, 'w') as f:
+            data = {k: list(v) for k, v in contacts.items()}
+            json.dump(data, f)
+    except Exception as e:
+        print(f"Error saving contacts: {e}")
+
+# Load contacts on startup
+load_contacts()
 
 @app.route('/')
 def index():
     return render_template('index.html')
 
+@socketio.on('connect')
+def handle_connect():
+    print(f'Client connected: {request.sid}')
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    print(f'Client disconnected: {request.sid}')
+    
+    # Clean up disconnected client
+    pid_to_remove = None
+    for pid, sid in clients.items():
+        if sid == request.sid:
+            pid_to_remove = pid
+            break
+    
+    if pid_to_remove:
+        del clients[pid_to_remove]
+        # Remove from temp_keys
+        temp_to_remove = [k for k, v in temp_keys.items() if v == pid_to_remove]
+        for temp in temp_to_remove:
+            del temp_keys[temp]
+        # Keep public key for future sessions
+        # del public_keys[pid_to_remove]
+
 @socketio.on('register')
 def register(data):
     pid = data['pid']
     temp = data['temp']
+    public_key = data.get('publicKey')
 
     clients[pid] = request.sid
     temp_keys[temp] = pid
     contacts.setdefault(pid, set())
+    
+    # Store public key
+    if public_key:
+        public_keys[pid] = public_key
 
     # Restore contacts on refresh
     emit('restore_contacts', list(contacts[pid]))
+    
+    # Notify contacts that this user is online
+    for contact_pid in contacts[pid]:
+        if contact_pid in clients:
+            emit('contact_online', pid, to=clients[contact_pid])
 
 @socketio.on('request_connect')
 def request_connect(data):
@@ -31,41 +95,124 @@ def request_connect(data):
     target_temp = data['target_temp']
 
     if target_temp not in temp_keys:
+        emit('request_failed', {'error': 'User not found or offline'})
         return
 
     target_pid = temp_keys[target_temp]
-    emit('incoming_request', sender_pid, to=clients[target_pid])
+    
+    # Check if already contacts
+    if target_pid in contacts.get(sender_pid, set()):
+        emit('request_failed', {'error': 'Already in contacts'})
+        return
+    
+    if target_pid not in clients:
+        emit('request_failed', {'error': 'User offline'})
+        return
+
+    # Send request with sender's public key
+    emit('incoming_request', {
+        'sender_pid': sender_pid,
+        'publicKey': public_keys.get(sender_pid)
+    }, to=clients[target_pid])
 
 @socketio.on('accept_request')
 def accept_request(data):
     a = data['acceptor']
     b = data['sender']
+    encrypted_key = data['encryptedKey']
+    acceptor_public_key = data['publicKey']
 
+    # Add bidirectional contacts
     contacts[a].add(b)
     contacts[b].add(a)
+    
+    # Persist to file
+    save_contacts()
 
-    emit('request_accepted', b, to=clients[a])
-    emit('request_accepted', a, to=clients[b])
+    # Send encrypted key and public key to requester
+    if b in clients:
+        emit('request_accepted', {
+            'friend_pid': a,
+            'encryptedKey': encrypted_key,
+            'publicKey': acceptor_public_key
+        }, to=clients[b])
+    
+    # Confirm to acceptor
+    if a in clients:
+        emit('request_accepted', {
+            'friend_pid': b,
+            'encryptedKey': None,  # Acceptor generated the key
+            'publicKey': public_keys.get(b)
+        }, to=clients[a])
+
+@socketio.on('request_key_exchange')
+def request_key_exchange(data):
+    sender = data['from']
+    receiver = data['to']
+    public_key = data['publicKey']
+    
+    # Verify they are contacts
+    if receiver not in contacts.get(sender, set()):
+        return
+    
+    # Forward key exchange request
+    if receiver in clients:
+        emit('key_exchange_request', {
+            'from': sender,
+            'publicKey': public_key
+        }, to=clients[receiver])
+
+@socketio.on('key_exchange_response')
+def key_exchange_response(data):
+    sender = data['from']
+    receiver = data['to']
+    encrypted_key = data['encryptedKey']
+    public_key = data['publicKey']
+    
+    # Verify they are contacts
+    if receiver not in contacts.get(sender, set()):
+        return
+    
+    # Forward key exchange response
+    if receiver in clients:
+        emit('key_exchange_response', {
+            'from': sender,
+            'encryptedKey': encrypted_key,
+            'publicKey': public_key
+        }, to=clients[receiver])
 
 @socketio.on('send_message')
 def send_message(data):
     sender = data['from']
     receiver = data['to']
-    message = data['message']
+    encrypted_message = data['message']
 
+    # Verify they are contacts
     if receiver not in contacts.get(sender, set()):
+        emit('error', {'message': 'Not in contact list'})
         return
 
-    emit('receive_message', {
-        'from': sender,
-        'message': message
-    }, to=clients[receiver])
+    # Send to receiver if online (encrypted message)
+    if receiver in clients:
+        emit('receive_message', {
+            'from': sender,
+            'message': encrypted_message
+        }, to=clients[receiver])
 
+    # Echo back to sender (stays encrypted)
     emit('receive_message', {
         'from': sender,
-        'message': message
+        'message': encrypted_message,
+        'sent_by_me': True
     }, to=clients[sender])
 
+@socketio.on('typing')
+def handle_typing(data):
+    sender = data['from']
+    receiver = data['to']
+    
+    if receiver in clients and receiver in contacts.get(sender, set()):
+        emit('typing', {'from': sender}, to=clients[receiver])
+
 if __name__ == '__main__':
-    socketio.run(app, debug=True)
-    app.run(host="0.0.0.0", port=5000)
+    socketio.run(app, debug=True, host="0.0.0.0", port=5000)
