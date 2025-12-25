@@ -1,5 +1,44 @@
 const socket = io();
 
+/* ---------- NOTIFICATION PERMISSION ---------- */
+let notificationsEnabled = false;
+
+async function requestNotificationPermission() {
+    if ("Notification" in window) {
+        const permission = await Notification.requestPermission();
+        notificationsEnabled = permission === "granted";
+        return notificationsEnabled;
+    }
+    return false;
+}
+
+function showNotification(title, body, friend) {
+    if (notificationsEnabled && document.hidden) {
+        const notification = new Notification(title, {
+            body: body,
+            icon: '🔒',
+            tag: friend,
+            requireInteraction: false
+        });
+        
+        notification.onclick = () => {
+            window.focus();
+            // Auto-select the friend who sent the message
+            const contactEl = document.getElementById(friend);
+            if (contactEl) {
+                contactEl.click();
+            }
+            notification.close();
+        };
+        
+        // Auto close after 5 seconds
+        setTimeout(() => notification.close(), 5000);
+    }
+}
+
+// Request permission on load
+requestNotificationPermission();
+
 /* ---------- CRYPTO UTILITIES ---------- */
 let keyPair = null;
 let contactPublicKeys = {}; // friend_pid -> publicKey
@@ -162,8 +201,9 @@ new QRCode(document.getElementById("qr"), {
 
 let activeFriend = null;
 let contactNames = {}; // Store custom names: pid -> custom_name
-let editingContact = null; // Track which contact is being edited
-let deletingContact = null; // Track which contact is being deleted
+let editingContact = null;
+let deletingContact = null;
+let typingTimeout = null;
 
 // Load custom names from localStorage
 function loadContactNames() {
@@ -212,7 +252,6 @@ function sendRequest() {
         target_temp: key
     });
     
-    // Close modal and clear input
     closeAddContact();
     document.getElementById("friendKey").value = "";
     
@@ -235,10 +274,8 @@ function startScan() {
             qrScanner.stop();
             scannerDiv.innerHTML = "";
             
-            // Close modal
             closeAddContact();
 
-            // Auto send request
             socket.emit("request_connect", {
                 sender_pid: pid,
                 target_temp: scannedKey
@@ -257,6 +294,9 @@ function startScan() {
 socket.on("incoming_request", async data => {
     const sender = data.sender_pid;
     const senderPublicKey = data.publicKey;
+    
+    // Play notification sound
+    playNotificationSound();
     
     if (confirm("Accept chat request from " + sender + "?")) {
         // Store their public key
@@ -312,6 +352,12 @@ socket.on("restore_contacts", async friends => {
                 publicKey: myPublicKey
             });
         }
+        
+        // Load message history for this friend
+        socket.emit("load_message_history", {
+            user_pid: pid,
+            friend_pid: friend
+        });
     }
 });
 
@@ -348,6 +394,39 @@ socket.on("key_exchange_response", async data => {
     
     // Decrypt shared key
     sharedSecrets[friend] = await decryptAESKey(encryptedKey);
+    
+    // Load message history after key exchange
+    socket.emit("load_message_history", {
+        user_pid: pid,
+        friend_pid: friend
+    });
+});
+
+/* ---------- MESSAGE HISTORY ---------- */
+socket.on("message_history", async data => {
+    const friend = data.friend_pid;
+    const messages = data.messages;
+    
+    // Only load if this is the active chat
+    if (friend !== activeFriend) return;
+    
+    const chatBox = document.getElementById("chatBox");
+    chatBox.innerHTML = "";
+    
+    for (const msg of messages) {
+        if (!sharedSecrets[friend]) continue;
+        
+        try {
+            const decryptedText = await decryptMessage(msg.message, sharedSecrets[friend]);
+            const sentByMe = msg.from === pid;
+            
+            displayMessage(decryptedText, sentByMe, msg.timestamp);
+        } catch (e) {
+            console.error("Failed to decrypt message:", e);
+        }
+    }
+    
+    chatBox.scrollTop = chatBox.scrollHeight;
 });
 
 /* ---------- CONTACTS ---------- */
@@ -384,8 +463,11 @@ function addContact(friend) {
         document.getElementById("chatContactStatus").innerText = '🔒 End-to-end encrypted';
         document.getElementById("chatAvatar").innerText = initial;
         
-        // Clear chat
-        document.getElementById("chatBox").innerHTML = "";
+        // Load message history for this friend
+        socket.emit("load_message_history", {
+            user_pid: pid,
+            friend_pid: friend
+        });
         
         // Mobile: open chat
         if (window.innerWidth <= 1000) {
@@ -436,6 +518,12 @@ async function sendMsg() {
     });
 
     input.value = "";
+    
+    // Stop typing indicator
+    socket.emit("stop_typing", {
+        from: pid,
+        to: activeFriend
+    });
 }
 
 // Handle Enter key in message input
@@ -443,22 +531,86 @@ document.getElementById("msg").addEventListener("keypress", (e) => {
     if (e.key === "Enter") sendMsg();
 });
 
+// Typing indicator
+document.getElementById("msg").addEventListener("input", (e) => {
+    if (!activeFriend) return;
+    
+    if (e.target.value.length > 0) {
+        socket.emit("typing", {
+            from: pid,
+            to: activeFriend
+        });
+        
+        // Clear existing timeout
+        if (typingTimeout) clearTimeout(typingTimeout);
+        
+        // Stop typing after 3 seconds of inactivity
+        typingTimeout = setTimeout(() => {
+            socket.emit("stop_typing", {
+                from: pid,
+                to: activeFriend
+            });
+        }, 3000);
+    } else {
+        socket.emit("stop_typing", {
+            from: pid,
+            to: activeFriend
+        });
+    }
+});
+
+/* ---------- DISPLAY MESSAGE ---------- */
+function displayMessage(text, sentByMe, timestamp) {
+    const chat = document.getElementById("chatBox");
+    
+    const messageDiv = document.createElement("div");
+    messageDiv.className = sentByMe ? "message sent" : "message received";
+    
+    const date = timestamp ? new Date(timestamp) : new Date();
+    const timeStr = date.getHours().toString().padStart(2, '0') + ':' + 
+                   date.getMinutes().toString().padStart(2, '0');
+    
+    messageDiv.innerHTML = `
+        <div class="message-bubble">
+            <div class="message-text">${escapeHtml(text)}</div>
+            <div class="message-time">${timeStr}</div>
+        </div>
+    `;
+    
+    chat.appendChild(messageDiv);
+    chat.scrollTop = chat.scrollHeight;
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
 /* ---------- RECEIVE MESSAGE ---------- */
 socket.on("receive_message", async data => {
     const sender = data.from;
     const encryptedMsg = data.message;
     const sentByMe = data.sent_by_me;
+    const timestamp = data.timestamp;
     
-    // Determine which friend this message is for/from
     const friendPid = sentByMe ? activeFriend : sender;
     
-    // Only show message if it's in the currently active chat
-    if (sentByMe && sender !== pid) {
-        return; // This shouldn't happen, but just in case
-    }
+    if (sentByMe && sender !== pid) return;
     
     if (!sentByMe && sender !== activeFriend) {
-        return; // Message from someone who isn't the active chat
+        // Show notification for messages from other contacts
+        if (!sharedSecrets[sender]) return;
+        
+        try {
+            const msg = await decryptMessage(encryptedMsg, sharedSecrets[sender]);
+            const senderName = contactNames[sender] || sender.substring(0, 20);
+            showNotification(senderName, msg, sender);
+            playNotificationSound();
+        } catch (e) {
+            console.error("Failed to decrypt notification message:", e);
+        }
+        return;
     }
     
     if (!sharedSecrets[friendPid]) {
@@ -468,31 +620,42 @@ socket.on("receive_message", async data => {
     
     try {
         const msg = await decryptMessage(encryptedMsg, sharedSecrets[friendPid]);
+        displayMessage(msg, sentByMe, timestamp);
         
-        const chat = document.getElementById("chatBox");
-        
-        // Create WhatsApp-style message
-        const messageDiv = document.createElement("div");
-        messageDiv.className = sentByMe ? "message sent" : "message received";
-        
-        const now = new Date();
-        const timeStr = now.getHours().toString().padStart(2, '0') + ':' + 
-                       now.getMinutes().toString().padStart(2, '0');
-        
-        messageDiv.innerHTML = `
-            <div class="message-bubble">
-                <div class="message-text">${msg}</div>
-                <div class="message-time">${timeStr}</div>
-            </div>
-        `;
-        
-        chat.appendChild(messageDiv);
-        chat.scrollTop = chat.scrollHeight;
+        // Show notification if not sent by me
+        if (!sentByMe) {
+            const senderName = contactNames[sender] || sender.substring(0, 20);
+            showNotification(senderName, msg, sender);
+            playNotificationSound();
+        }
     } catch (e) {
         console.error("Decryption failed:", e);
         alert("Failed to decrypt message");
     }
 });
+
+/* ---------- TYPING INDICATOR ---------- */
+socket.on("typing", data => {
+    if (data.from === activeFriend) {
+        document.getElementById("chatContactStatus").innerText = 'typing...';
+    }
+});
+
+socket.on("stop_typing", data => {
+    if (data.from === activeFriend) {
+        const statusEl = document.getElementById(`status-${activeFriend}`);
+        const isOnline = statusEl && statusEl.classList.contains('online');
+        document.getElementById("chatContactStatus").innerText = 
+            isOnline ? '🟢 Online • End-to-end encrypted' : '🔒 End-to-end encrypted';
+    }
+});
+
+/* ---------- NOTIFICATION SOUND ---------- */
+function playNotificationSound() {
+    const audio = new Audio('data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhBTGH0fPTgjMGHm7A7+OZSA0PVKzn7KthFwlBmeHwuWoaBjCE0vLRgzUHGm+/7uKZSgwPVqzm6apfFglBmeHwuWoaBjCE0vLRgzUHGm+/7uKZSgwPVqzm6apfFglBmeHwuWoaBjCE0vLRgzUHGm+/7uKZSgwPVqzm6apfFglBmeHwuWoaBjCE0vLRgzUHGm+/7uKZSgwPVqzm6apfFglBmeHwuWoaBjCE0vLRgzUHGm+/7uKZSgwPVqzm6apfFglBmeHwuWoaBjCE0vLRgzUHGm+/7uKZSgwPVqzm6apfFglBmeHwuWoaBjCE0vLRgzUHGm+/7uKZSgwPVqzm6apfFglBmeHwuWoaBjCE0vLRgzUHGm+/7uKZSgwPVqzm6apfFglBmeHwuWoaBjCE0vLRgzUHGm+/7uKZSgwPVqzm6apfFglBmeHwuWoaBjCE0vLRgzUHGm+/7uKZSgwPVqzm6apfFglBmeHwuWoaBjCE0vLRgzUHGm+/7uKZSgwPVqzm6apfFg==');
+    audio.volume = 0.3;
+    audio.play().catch(e => console.log("Audio play failed:", e));
+}
 
 /* ---------- ERROR HANDLING ---------- */
 socket.on("request_failed", data => {
@@ -510,9 +673,19 @@ socket.on("contact_online", friend => {
         statusEl.classList.add('online');
     }
     
-    // Update chat header if this is the active friend
     if (friend === activeFriend) {
         document.getElementById("chatContactStatus").innerText = '🟢 Online • End-to-end encrypted';
+    }
+});
+
+socket.on("contact_offline", friend => {
+    const statusEl = document.getElementById(`status-${friend}`);
+    if (statusEl) {
+        statusEl.classList.remove('online');
+    }
+    
+    if (friend === activeFriend) {
+        document.getElementById("chatContactStatus").innerText = '🔒 End-to-end encrypted';
     }
 });
 
@@ -564,6 +737,12 @@ function closeDeleteContact() {
 function confirmDeleteContact() {
     if (!deletingContact) return;
     
+    // Notify server
+    socket.emit("delete_contact", {
+        user_pid: pid,
+        contact_pid: deletingContact
+    });
+    
     // Remove from UI
     const contactEl = document.getElementById(deletingContact);
     if (contactEl) {
@@ -586,7 +765,6 @@ function confirmDeleteContact() {
         `;
         document.getElementById('chatContactName').innerText = 'Select a contact';
         
-        // Close chat on mobile
         if (window.innerWidth <= 1000) {
             closeChat();
         }
@@ -595,8 +773,6 @@ function confirmDeleteContact() {
     // Remove encryption keys
     delete sharedSecrets[deletingContact];
     delete contactPublicKeys[deletingContact];
-    
-    // Notify server (optional - you can add a socket event to remove from server contacts)
     
     closeDeleteContact();
     
